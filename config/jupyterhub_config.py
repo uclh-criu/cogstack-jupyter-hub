@@ -91,9 +91,10 @@ c.DockerSpawner.remove = False
 if SELECT_NOTEBOOK_IMAGE_ALLOWED == "true":
     # c.DockerSpawner.image_whitelist has been deprecated for allowed_images
     c.DockerSpawner.allowed_images = {
-        "minimal": "jupyterhub/singleuser:latest",
-        "cogstack": "cogstacksystems/jupyter-singleuser:latest",
-        "cogstack-gpu": "cogstacksystems/jupyter-singleuser-gpu:latest"
+        "minimal": "jupyterhub/singleuser:5.5.0",
+        'datascience': 'jupyter/datascience-notebook:r-4.3.1',
+        "cogstack": "cogstacksystems/jupyter-singleuser:sha-ea5a685",
+        # "cogstack-gpu": "cogstacksystems/jupyter-singleuser-gpu:latest"
     }
     # https://github.com/jupyterhub/dockerspawner/issues/423
     c.DockerSpawner.remove = True
@@ -109,8 +110,9 @@ if RUN_IN_DEBUG_MODE == "true":
 # Spawn single-user servers as Docker containers
 class DockerSpawner(dockerspawner.DockerSpawner):
     def start(self):
+        # handle user container and team container in combined_pre_spawn_hook
         # username is self.user.name
-        self.volumes = {"jupyterhub-user-{}".format(self.user.name): NOTEBOOK_DIR}
+        # self.volumes = {"jupyterhub-user-{}".format(safe_username): NOTEBOOK_DIR}
 
         # Mount the real users Docker volume on the host to the notebook user"s
         # # notebook directory in the container
@@ -122,13 +124,13 @@ class DockerSpawner(dockerspawner.DockerSpawner):
                 f.write("\n")
                 f.write(self.user.name)
 
-        if self.user.name in list(team_map.keys()):
-            for team in team_map[self.user.name]:
-                team_dir_path = os.path.join(SHARED_CONTENT_DIR, team)
-                self.volumes["jupyterhub-team-{}".format(team)] = {
-                    "bind": team_dir_path,
-                    "mode": "rw",  # or ro for read-only
-                }
+        # if self.user.name in list(team_map.keys()):
+        #     for team in team_map[self.user.name]:
+        #         team_dir_path = os.path.join(SHARED_CONTENT_DIR, team)
+        #         self.volumes["jupyterhub-team-{}".format(team)] = {
+        #             "bind": team_dir_path,
+        #             "mode": "rw",  # or ro for read-only
+        #         }
 
         # this is a temporary fix, need to actually check permissions
         self.mem_limit = RESOURCE_ALLOCATION_USER_RAM_LIMIT
@@ -149,7 +151,42 @@ def pre_spawn_hook(spawner: DockerSpawner):
     except Exception:
         traceback.print_exc()
 
+# Special handling sanitize username and mount share docker volume using keycloak group setting
+async def combined_pre_spawn_hook(spawner):
+    # Run your original proxy text configurations
+    pre_spawn_hook(spawner)
 
+    # sanitize username exactly how DockerSpawner expects it
+    safe_username = spawner.user.name.replace("@", "_at_")
+
+    # Map the host volume (safe_username) to the internal container path
+    volumes = {
+        "jupyterhub-user-{}".format(safe_username): {
+            "bind": "/home/jovyan/work",
+            "mode": "rw"
+        }
+    }
+
+    # Fetch Keycloak groups and dynamically append team folders
+    auth_state = await spawner.user.get_auth_state()
+    if auth_state:
+        user_groups = auth_state.get('groups', []) or auth_state.get('oauth_user', {}).get('groups', [])
+
+        allowed_sharing_groups = {"cogstack_sharing", "dt4h_sharing", "search_sharing", "general_sharing"}
+
+        for group in user_groups:
+            if group in allowed_sharing_groups:
+                # Use the group name dynamically in the destination mount path
+                team_dir_path = os.path.join(SHARED_CONTENT_DIR, group)
+
+                # Match the volume name structure you want on the host
+                volumes['jupyterhub-team-{}'.format(group)] = {
+                    "bind": team_dir_path,
+                    "mode": "rw",
+                }
+
+    # Assign the completely aggregated volume dictionary to the spawner
+    spawner.volumes = volumes
 """
     def pre_spawn_hook(spawner):
         username = str(spawner.user.name).lower()
@@ -160,7 +197,7 @@ def pre_spawn_hook(spawner: DockerSpawner):
 """
 
 c.Spawner.default_url = WORK_DIR
-c.Spawner.pre_spawn_hook = pre_spawn_hook
+c.Spawner.pre_spawn_hook = combined_pre_spawn_hook
 
 #c.Spawner.ip = "127.0.0.1"
 
@@ -247,18 +284,19 @@ with open(userlist_path) as f:
 
             c.DockerSpawner.extra_host_config = prev_conf
 
+# comment due to combined_pre_spawn_hook handling
 # Get team memberships
-team_map = {user: set() for user in whitelist}
-with open(teamlist_path) as f:
-    for line in f:
-        if not line:
-            continue
-        parts = line.split()
-        if len(parts) > 1:
-            team = parts[0]
-            members = set(parts[1:])
-            for member in members:
-                team_map[member].add(team)
+# team_map = {user: set() for user in whitelist}
+# with open(teamlist_path) as f:
+#     for line in f:
+#         if not line:
+#             continue
+#         parts = line.split()
+#         if len(parts) > 1:
+#             team = parts[0]
+#             members = set(parts[1:])
+#             for member in members:
+#                 team_map[member].add(team)
 
 gpu_support_enabled = os.environ.get("JUPYTERHUB_DOCKER_ENABLE_GPU_SUPPORT", "false")
 
@@ -283,6 +321,9 @@ c.DockerSpawner.environment.update(ENV_PROXIES)
 #c.JupyterHub.authenticator_class = LocalNativeAuthenticator
 
 if ENABLE_OIDC_AUTH == "true":
+    # For Keycloak groups spawning
+    c.Authenticator.enable_auth_state = True
+
     # Use Generic OAuth with Keycloak
     c.JupyterHub.authenticator_class = GenericOAuthenticator
 
@@ -314,8 +355,9 @@ if ENABLE_OIDC_AUTH == "true":
 
     # Require users to be in specific Keycloak groups
     c.GenericOAuthenticator.manage_groups = True
-    c.GenericOAuthenticator.allowed_groups = ["jupyterhub-users", "juypterhub-admins"]
-    c.GenericOAuthenticator.claim_groups_key = "groups"
+    c.GenericOAuthenticator.allowed_groups = ["jupyterhub-users", "juypterhub-admins", "cogstack_sharing", "dt4h_sharing", "search_sharing", "general_sharing"]
+    # c.GenericOAuthenticator.claim_groups_key = "groups" # deprecated due to OAuthenticator 17.0
+    c.GenericOAuthenticator.auth_state_groups_key = 'oauth_user.groups'
 
     # Map Keycloak roles to JupyterHub admin
     c.GenericOAuthenticator.admin_groups = ["jupyterhub-admins"]
@@ -323,7 +365,7 @@ if ENABLE_OIDC_AUTH == "true":
     c.GenericOAuthenticator.scope = ["openid", "profile", "email", "groups"]
 
     # Allow all authenticated users (or restrict with allowed_groups above)
-    # c.GenericOAuthenticator.allow_all = True
+    c.GenericOAuthenticator.allow_all = True
 else:
     c.FirstUseAuthenticator.create_users = True
     c.JupyterHub.authenticator_class = "firstuseauthenticator.FirstUseAuthenticator"
